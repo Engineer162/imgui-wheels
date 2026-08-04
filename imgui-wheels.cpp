@@ -85,6 +85,16 @@ static float apply_drag_sensitivity_curve(float normalized_delta) {
     return (normalized_delta < 0.0f) ? -curved : curved;
 }
 
+static float apply_integer_detent_resistance(float value, float min_v, float max_v, float detent_width = 0.42f, float resistance = 0.72f) {
+    const float nearest = floorf(value + 0.5f);
+    const float dist = value - nearest;
+    const float abs_dist = fabsf(dist);
+    const float t = ImSaturate(abs_dist / ImMax(0.0001f, detent_width));
+    const float leave_factor = t * t * (3.0f - 2.0f * t); // smoothstep
+    const float local_scale = (1.0f - resistance) + (resistance * leave_factor);
+    return std::clamp(nearest + dist * local_scale, min_v, max_v);
+}
+
 static bool update_drag(const wheel_state& state, ImGuiID id, float speed, float v_min, float v_max, float* value) {
     if (value == nullptr) {
         return false;
@@ -155,6 +165,36 @@ static void draw_barrel(const wheel_state& state, const palette_state& palette, 
     const float height = state.height;
     const bool is_horizontal = state.is_horizontal;
 
+    if (width <= 1.0f || height <= 1.0f) {
+        return;
+    }
+
+    ImDrawList* draw_list = window->DrawList;
+
+    const float slot_rounding = ImClamp((is_horizontal ? height : width) * 0.22f, 2.0f, 8.0f);
+    const float housing_margin = 2.0f;
+    const float slot_inset = 1.5f;
+    const ImRect slot_outer(
+        ImVec2(wheel_bb.Min.x - housing_margin, wheel_bb.Min.y - housing_margin),
+        ImVec2(wheel_bb.Max.x + housing_margin, wheel_bb.Max.y + housing_margin));
+    const ImRect slot_inner(
+        ImVec2(slot_outer.Min.x + slot_inset, slot_outer.Min.y + slot_inset),
+        ImVec2(slot_outer.Max.x - slot_inset, slot_outer.Max.y - slot_inset));
+
+    draw_list->AddRectFilled(slot_outer.Min, slot_outer.Max, IM_COL32(8, 8, 8, 255), slot_rounding);
+    draw_list->AddRectFilled(slot_inner.Min, slot_inner.Max, IM_COL32(2, 2, 2, 255), ImMax(0.0f, slot_rounding - 1.0f));
+
+    if (is_horizontal) {
+        draw_list->AddRectFilledMultiColor(slot_inner.Min, slot_inner.Max,
+            IM_COL32(255, 255, 255, 18), IM_COL32(255, 255, 255, 18), IM_COL32(0, 0, 0, 90), IM_COL32(0, 0, 0, 90));
+    } else {
+        draw_list->AddRectFilledMultiColor(slot_inner.Min, slot_inner.Max,
+            IM_COL32(255, 255, 255, 20), IM_COL32(0, 0, 0, 90), IM_COL32(0, 0, 0, 90), IM_COL32(255, 255, 255, 20));
+    }
+    draw_list->AddRect(slot_inner.Min, slot_inner.Max, IM_COL32(255, 255, 255, 20), ImMax(0.0f, slot_rounding - 1.0f));
+
+    draw_list->PushClipRect(slot_inner.Min, slot_inner.Max, true);
+
     const int segments = 32;
     ImVec2 min_points[segments + 1];
     ImVec2 max_points[segments + 1];
@@ -162,29 +202,36 @@ static void draw_barrel(const wheel_state& state, const palette_state& palette, 
     const float main_axis_length = is_horizontal ? width : height;
     const float cross_axis_center = is_horizontal ? (wheel_bb.Min.y + height * 0.5f) : (wheel_bb.Min.x + width * 0.5f);
     const float cross_axis_max_height = is_horizontal ? height : width;
+    const float profile_power = 2.45f;
 
     for (int px = 0; px <= static_cast<int>(main_axis_length); px++) {
         const float rel_p = px / main_axis_length;
-        const float cos_a = rel_p * 2.0f - 1.0f;
-        const float sin_a = sqrtf(ImMax(0.0f, 1.0f - cos_a * cos_a));
+        const float profile_t = fabsf(rel_p * 2.0f - 1.0f);
+        const float sin_a = powf(ImMax(0.0f, 1.0f - powf(profile_t, profile_power)), 1.0f / profile_power);
 
-        float base_half_thick = (cross_axis_max_height * 0.5f) - 2.0f;
-        const float dynamic_half_thick = base_half_thick * (0.4f + 0.6f * sin_a);
-        const float thick_min = cross_axis_center - dynamic_half_thick - 2.0f;
-        const float thick_max = cross_axis_center + dynamic_half_thick + 2.0f;
+        float base_half_thick = (cross_axis_max_height * 0.5f) - 2.5f;
+        const float curvature = powf(sin_a, 0.85f);
+        const float dynamic_half_thick = base_half_thick * (0.30f + 0.70f * curvature);
+        const float thick_min = cross_axis_center - dynamic_half_thick - 1.0f;
+        const float thick_max = cross_axis_center + dynamic_half_thick + 1.0f;
 
-        const float shadow_factor = powf(sin_a, 0.4f);
+        const float shadow_factor = powf(sin_a, 0.35f);
         ImVec4 shaded_v4 = palette.base_bg;
-        const float darken_floor = 0.35f;
+        const float darken_floor = 0.28f;
         const float blend_mult = 1.0f - darken_floor;
         shaded_v4.x *= (darken_floor + blend_mult * shadow_factor);
         shaded_v4.y *= (darken_floor + blend_mult * shadow_factor);
         shaded_v4.z *= (darken_floor + blend_mult * shadow_factor);
+
+        const float specular = powf(sin_a, 4.0f) * 0.16f;
+        shaded_v4.x = ImClamp(shaded_v4.x + specular, 0.0f, 1.0f);
+        shaded_v4.y = ImClamp(shaded_v4.y + specular, 0.0f, 1.0f);
+        shaded_v4.z = ImClamp(shaded_v4.z + specular, 0.0f, 1.0f);
         const ImU32 column_color = ImGui::ColorConvertFloat4ToU32(shaded_v4);
 
         const ImVec2 line_start = is_horizontal ? ImVec2(wheel_bb.Min.x + px, thick_min) : ImVec2(thick_min, wheel_bb.Min.y + px);
         const ImVec2 line_end = is_horizontal ? ImVec2(wheel_bb.Min.x + px, thick_max) : ImVec2(thick_max, wheel_bb.Min.y + px);
-        window->DrawList->AddLine(line_start, line_end, column_color, 1.0f);
+        draw_list->AddLine(line_start, line_end, column_color, 1.0f);
 
         for (int s = 0; s <= segments; s++) {
             if (px == static_cast<int>(main_axis_length * (static_cast<float>(s) / segments))) {
@@ -208,12 +255,12 @@ static void draw_barrel(const wheel_state& state, const palette_state& palette, 
             const float relative_p = (cos_a + 1.0f) * 0.5f;
             const float groove_p = (is_horizontal ? wheel_bb.Min.x : wheel_bb.Min.y) + relative_p * main_axis_length;
 
-            float base_half_thick = (cross_axis_max_height * 0.5f) - 2.0f;
+            float base_half_thick = (cross_axis_max_height * 0.5f) - 2.5f;
             if (i % 2 != 0) {
                 base_half_thick *= 0.6f;
             }
 
-            const float dynamic_half_thick = base_half_thick * (0.4f + 0.6f * sin_a);
+            const float dynamic_half_thick = base_half_thick * (0.30f + 0.70f * powf(sin_a, 0.85f));
             const float thick_min = cross_axis_center - dynamic_half_thick;
             const float thick_max = cross_axis_center + dynamic_half_thick;
 
@@ -231,18 +278,58 @@ static void draw_barrel(const wheel_state& state, const palette_state& palette, 
             const ImVec2 hlt_start = is_horizontal ? ImVec2(groove_p + 1.0f, thick_min) : ImVec2(thick_min, groove_p + 1.0f);
             const ImVec2 hlt_end = is_horizontal ? ImVec2(groove_p + 1.0f, thick_max) : ImVec2(thick_max, groove_p + 1.0f);
 
-            window->DrawList->AddLine(grv_start, grv_end, current_shadow, 2.0f);
-            window->DrawList->AddLine(hlt_start, hlt_end, current_highlight, 1.0f);
+            draw_list->AddLine(grv_start, grv_end, current_shadow, 2.0f);
+            draw_list->AddLine(hlt_start, hlt_end, current_highlight, 1.0f);
         }
     }
 
     const ImU32 border_color = ImGui::ColorConvertFloat4ToU32(palette.border);
     for (int i = 0; i < segments; ++i) {
-        window->DrawList->AddLine(min_points[i], min_points[i + 1], border_color, 1.0f);
-        window->DrawList->AddLine(max_points[i], max_points[i + 1], border_color, 1.0f);
+        draw_list->AddLine(min_points[i], min_points[i + 1], border_color, 1.0f);
+        draw_list->AddLine(max_points[i], max_points[i + 1], border_color, 1.0f);
     }
-    window->DrawList->AddLine(min_points[0], max_points[0], border_color, 1.0f);
-    window->DrawList->AddLine(min_points[segments], max_points[segments], border_color, 1.0f);
+
+    const ImU32 rim_shadow = IM_COL32(0, 0, 0, 80);
+    const ImU32 rim_highlight = IM_COL32(255, 255, 255, 55);
+    for (int i = 0; i < segments; ++i) {
+        if (is_horizontal) {
+            draw_list->AddLine(ImVec2(min_points[i].x, min_points[i].y + 1.0f), ImVec2(min_points[i + 1].x, min_points[i + 1].y + 1.0f), rim_shadow, 1.0f);
+            draw_list->AddLine(ImVec2(max_points[i].x, max_points[i].y - 1.0f), ImVec2(max_points[i + 1].x, max_points[i + 1].y - 1.0f), rim_highlight, 1.0f);
+        } else {
+            draw_list->AddLine(ImVec2(min_points[i].x + 1.0f, min_points[i].y), ImVec2(min_points[i + 1].x + 1.0f, min_points[i + 1].y), rim_shadow, 1.0f);
+            draw_list->AddLine(ImVec2(max_points[i].x - 1.0f, max_points[i].y), ImVec2(max_points[i + 1].x - 1.0f, max_points[i + 1].y), rim_highlight, 1.0f);
+        }
+    }
+
+    draw_list->AddLine(min_points[0], max_points[0], border_color, 1.0f);
+    draw_list->AddLine(min_points[segments], max_points[segments], border_color, 1.0f);
+
+    const float fade_span = ImMax(6.0f, main_axis_length * 0.14f);
+    if (is_horizontal) {
+        const ImVec2 l_min = slot_inner.Min;
+        const ImVec2 l_max = ImVec2(slot_inner.Min.x + fade_span, slot_inner.Max.y);
+        const ImVec2 r_min = ImVec2(slot_inner.Max.x - fade_span, slot_inner.Min.y);
+        const ImVec2 r_max = slot_inner.Max;
+
+        draw_list->AddRectFilledMultiColor(l_min, l_max,
+            IM_COL32(0, 0, 0, 235), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 235));
+        draw_list->AddRectFilledMultiColor(r_min, r_max,
+            IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 235), IM_COL32(0, 0, 0, 235), IM_COL32(0, 0, 0, 0));
+    } else {
+        const ImVec2 t_min = slot_inner.Min;
+        const ImVec2 t_max = ImVec2(slot_inner.Max.x, slot_inner.Min.y + fade_span);
+        const ImVec2 b_min = ImVec2(slot_inner.Min.x, slot_inner.Max.y - fade_span);
+        const ImVec2 b_max = slot_inner.Max;
+
+        draw_list->AddRectFilledMultiColor(t_min, t_max,
+            IM_COL32(0, 0, 0, 235), IM_COL32(0, 0, 0, 235), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
+        draw_list->AddRectFilledMultiColor(b_min, b_max,
+            IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 235), IM_COL32(0, 0, 0, 235));
+    }
+
+    draw_list->PopClipRect();
+
+    draw_list->AddRect(slot_outer.Min, slot_outer.Max, IM_COL32(30, 30, 30, 255), slot_rounding);
 }
 
 static void draw_label(const wheel_state& state, const ImGuiStyle& style, const char* label, const char* format, float value, bool is_test_value, bool is_integer_value = false) {
@@ -314,19 +401,55 @@ bool WheelInt(const char* label, int* v, int v_min, int v_max, ImVec2 size, Whee
     const ImGuiStyle& style = g.Style;
     const ImGuiID id = state.id;
 
-    float float_value = static_cast<float>(*v);
-    bool value_changed = state.value_changed;
-    value_changed = detail::update_drag(state, id, speed, static_cast<float>(v_min), static_cast<float>(v_max), &float_value) || value_changed;
-    if (value_changed) {
-        *v = static_cast<int>(std::round(float_value));
-        *v = std::clamp(*v, v_min, v_max);
-        float_value = static_cast<float>(*v);
+    ImGuiStorage* storage = &state.window->StateStorage;
+    const ImGuiID visual_key = id ^ 0x4f1bbcd1;
+    const ImGuiID init_key = id ^ 0x7a23d9b5;
+    if (storage->GetInt(init_key, 0) == 0) {
+        storage->SetInt(init_key, 1);
+        storage->SetFloat(visual_key, static_cast<float>(*v));
     }
 
+    float visual_value = storage->GetFloat(visual_key, static_cast<float>(*v));
+    float dragged_value = visual_value;
+    const bool drag_moved = detail::update_drag(state, id, speed, static_cast<float>(v_min), static_cast<float>(v_max), &dragged_value) || state.value_changed;
+    if (state.held) {
+        dragged_value = detail::apply_integer_detent_resistance(dragged_value, static_cast<float>(v_min), static_cast<float>(v_max));
+    }
+
+    const int previous_value = *v;
+    if (drag_moved) {
+        const float switch_threshold = 0.62f;
+        int stepped = previous_value;
+        while (stepped < v_max && dragged_value > static_cast<float>(stepped) + switch_threshold) {
+            ++stepped;
+        }
+        while (stepped > v_min && dragged_value < static_cast<float>(stepped) - switch_threshold) {
+            --stepped;
+        }
+        *v = std::clamp(stepped, v_min, v_max);
+    }
+
+    const float detent_target = static_cast<float>(*v);
+    if (state.held) {
+        const float detent_influence_range = 0.55f;
+        const float dist_to_detent = fabsf(dragged_value - detent_target);
+        const float proximity = ImSaturate(1.0f - (dist_to_detent / detent_influence_range));
+        const float proximity_smooth = proximity * proximity * (3.0f - 2.0f * proximity);
+        const float detent_pull = 0.22f * proximity_smooth;
+        visual_value = dragged_value + (detent_target - dragged_value) * detent_pull;
+    } else {
+        const float settle_speed = 0.30f;
+        visual_value = visual_value + (detent_target - visual_value) * settle_speed;
+        if (fabsf(visual_value - detent_target) < 0.001f) {
+            visual_value = detent_target;
+        }
+    }
+    storage->SetFloat(visual_key, visual_value);
+
     const detail::palette_state palette = detail::resolve_palette(state, invert_colors);
-    detail::draw_barrel(state, palette, float_value, static_cast<float>(v_min), static_cast<float>(v_max));
-    detail::draw_label(state, style, label, format, float_value, false, true);
-    return value_changed;
+    detail::draw_barrel(state, palette, visual_value, static_cast<float>(v_min), static_cast<float>(v_max));
+    detail::draw_label(state, style, label, format, static_cast<float>(*v), false, true);
+    return previous_value != *v;
 }
 
 bool WheelIntHorizontal(const char* label, int* v, int v_min, int v_max, ImVec2 size, const char* format, float speed, bool invert_colors) {
